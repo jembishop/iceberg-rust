@@ -409,19 +409,16 @@ pub(crate) fn update_snapshot_summaries(
 }
 
 #[allow(dead_code)]
-fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i32> {
+fn get_prop(previous_summary: &Summary, prop: &str) -> Result<i64> {
     let value_str = previous_summary
         .additional_properties
         .get(prop)
         .map(String::as_str)
         .unwrap_or("0");
-    value_str.parse::<i32>().map_err(|err| {
-        Error::new(
-            ErrorKind::Unexpected,
-            "Failed to parse value from previous summary property.",
-        )
-        .with_source(err)
-    })
+    // Tolerate corrupt/oversized historical values (e.g. u64 values written
+    // by a buggy producer that exceed i64::MAX): treat as 0 rather than
+    // failing the entire commit.
+    Ok(value_str.parse::<i64>().unwrap_or(0))
 }
 
 #[allow(dead_code)]
@@ -489,27 +486,30 @@ fn update_totals(
     added_property: &str,
     removed_property: &str,
 ) {
-    let previous_total = previous_summary.map_or(0, |previous_summary| {
+    // Tolerate corrupt/oversized historical values (treat as 0). Use
+    // saturating arithmetic so we never wrap around on subtraction.
+    let previous_total = previous_summary.map_or(0u64, |previous_summary| {
         previous_summary
             .additional_properties
             .get(total_property)
-            .map_or(0, |value| value.parse::<u64>().unwrap())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
     });
 
     let mut new_total = previous_total;
     if let Some(value) = summary
         .additional_properties
         .get(added_property)
-        .map(|value| value.parse::<u64>().unwrap())
+        .and_then(|value| value.parse::<u64>().ok())
     {
-        new_total += value;
+        new_total = new_total.saturating_add(value);
     }
     if let Some(value) = summary
         .additional_properties
         .get(removed_property)
-        .map(|value| value.parse::<u64>().unwrap())
+        .and_then(|value| value.parse::<u64>().ok())
     {
-        new_total -= value;
+        new_total = new_total.saturating_sub(value);
     }
     summary
         .additional_properties
