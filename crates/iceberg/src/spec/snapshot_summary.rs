@@ -486,30 +486,25 @@ fn update_totals(
     added_property: &str,
     removed_property: &str,
 ) {
-    // Tolerate corrupt/oversized historical values (treat as 0). Use
-    // saturating arithmetic so we never wrap around on subtraction.
-    let previous_total = previous_summary.map_or(0u64, |previous_summary| {
+    // Tolerate corrupt/oversized historical values. Iceberg consumers
+    // (Athena/Trino) parse these as Long (i64); any value > i64::MAX is
+    // unreadable and aborts queries. Treat such values as corrupt → 0.
+    // Use saturating i64 arithmetic so the new total never goes negative
+    // or overflows i64.
+    let parse_or_zero = |s: &str| -> i64 { s.parse::<i64>().unwrap_or(0).max(0) };
+    let previous_total = previous_summary.map_or(0i64, |previous_summary| {
         previous_summary
             .additional_properties
             .get(total_property)
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0)
+            .map_or(0, |v| parse_or_zero(v))
     });
 
     let mut new_total = previous_total;
-    if let Some(value) = summary
-        .additional_properties
-        .get(added_property)
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        new_total = new_total.saturating_add(value);
+    if let Some(value) = summary.additional_properties.get(added_property) {
+        new_total = new_total.saturating_add(parse_or_zero(value));
     }
-    if let Some(value) = summary
-        .additional_properties
-        .get(removed_property)
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        new_total = new_total.saturating_sub(value);
+    if let Some(value) = summary.additional_properties.get(removed_property) {
+        new_total = (new_total - parse_or_zero(value)).max(0);
     }
     summary
         .additional_properties
