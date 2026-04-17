@@ -240,7 +240,17 @@ impl OverwriteOperation {
         };
 
         for entry in manifest.entries() {
-            if entry.is_alive() && self.deleted_file_paths.contains(entry.file_path()) {
+            if !entry.is_alive() {
+                // Tombstone from a prior snapshot. Re-emit it as a deleted entry
+                // so its status is preserved — earlier code routed these to
+                // `add_existing_entry`, which unconditionally overwrites
+                // `status` to `Existing`, resurrecting files that were already
+                // removed in past snapshots and are likely no longer in S3.
+                let cloned: ManifestEntry = (**entry).clone();
+                writer.add_deleted_entry(cloned)?;
+                continue;
+            }
+            if self.deleted_file_paths.contains(entry.file_path()) {
                 let mut deleted: ManifestEntry = (**entry).clone();
                 deleted.snapshot_id = Some(self.snapshot_id);
                 writer.add_deleted_entry(deleted)?;
@@ -525,6 +535,85 @@ mod tests {
                 .any(|(status, path)| *status == ManifestStatus::Deleted
                     && path == "test/original.parquet"),
             "Deleted entry should survive fast_append, entries: {all_entries:?}",
+        );
+    }
+
+    /// Regression test: a second overwrite must not resurrect tombstones from
+    /// the first overwrite. Earlier behaviour wrote previously-deleted entries
+    /// back as `Existing` because the rewrite loop routed them through
+    /// `add_existing_entry`, which forces status=Existing. With many
+    /// compaction cycles that quietly republished references to S3 objects
+    /// that had already been physically deleted by the caller, breaking
+    /// downstream readers (e.g. Athena) with NoSuchKey errors.
+    #[tokio::test]
+    async fn test_overwrite_does_not_resurrect_prior_tombstones() {
+        use crate::memory::tests::new_memory_catalog;
+        use crate::transaction::ApplyTransactionAction;
+        use crate::transaction::tests::make_v3_minimal_table_in_catalog;
+
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        let spec_id = table.metadata().default_partition_spec_id();
+
+        // Snapshot 1: append two original files.
+        let f1 = test_data_file("test/f1.parquet", spec_id);
+        let f2 = test_data_file("test/f2.parquet", spec_id);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .fast_append()
+            .add_data_files(vec![f1.clone(), f2.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Snapshot 2: overwrite — replace f1 with f1_compact. f1 becomes a
+        // Deleted tombstone; f2 stays Existing; f1_compact is Added.
+        let f1_compact = test_data_file("test/f1_compact.parquet", spec_id);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite()
+            .add_data_files(vec![f1_compact.clone()])
+            .delete_data_files(vec![f1.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        // Snapshot 3: another overwrite touching only f2. Critically, f1's
+        // tombstone from snapshot 2 must remain Deleted, not be resurrected
+        // as Existing.
+        let f2_compact = test_data_file("test/f2_compact.parquet", spec_id);
+        let tx = Transaction::new(&table);
+        let action = tx
+            .overwrite()
+            .add_data_files(vec![f2_compact.clone()])
+            .delete_data_files(vec![f2.clone()]);
+        let tx = action.apply(tx).unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+
+        let mut all_entries = vec![];
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                all_entries.push((entry.status(), entry.file_path().to_string()));
+            }
+        }
+
+        let f1_statuses: Vec<_> = all_entries
+            .iter()
+            .filter(|(_, p)| p == "test/f1.parquet")
+            .map(|(s, _)| *s)
+            .collect();
+        assert!(
+            f1_statuses.iter().all(|s| *s == ManifestStatus::Deleted),
+            "f1 tombstone resurrected by second overwrite — saw statuses {f1_statuses:?} (full entries: {all_entries:?})"
+        );
+        assert!(
+            !f1_statuses.is_empty(),
+            "f1 tombstone disappeared entirely from manifest after second overwrite — full entries: {all_entries:?}"
         );
     }
 }
